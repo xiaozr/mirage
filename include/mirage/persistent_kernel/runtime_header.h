@@ -344,18 +344,39 @@ struct RuntimeConfig {
   TaskId **worker_queues;
   EventId **sched_queues;
   TaskId *first_tasks;
-  int *step;                      // Metadata for LLM serving
-  long long *tokens;              // Metadata for LLM serving
-  long long *input_tokens;        // Metadata for LLM serving
-  long long *output_tokens;       // Metadata for LLM serving
-  long long eos_token_id;         // Metadata for LLM serving
-  int max_seq_length;             // Metadata for LLM serving
-  int *new_token_nums;            // Metadata for LLM serving
-  int *qo_indptr_buffer;          // Metadata for LLM serving (paged attention)
-  int *paged_kv_indptr_buffer;    // Metadata for LLM serving (paged attention)
-  int *paged_kv_indices_buffer;   // Metadata for LLM serving (paged attention)
-  int *paged_kv_indices_snapshot; // Scheduler snapshot for in-place compaction
-  int *paged_kv_last_page_len_buffer; // Metadata for LLM serving
+  int *step;                // Metadata for LLM serving
+  long long *tokens;        // Metadata for LLM serving
+  long long *input_tokens;  // Metadata for LLM serving
+  long long *output_tokens; // Metadata for LLM serving
+  long long eos_token_id;   // Metadata for LLM serving
+  int max_seq_length;       // Metadata for LLM serving
+  int *new_token_nums;      // Metadata for LLM serving
+  int *qo_indptr_buffer;    // Metadata for LLM serving (paged attention)
+#ifndef MPK_NUM_KV_GROUPS
+#define MPK_NUM_KV_GROUPS 1
+#endif
+// Tokens per KV tile in the windowed attention kernel.
+#ifndef MPK_KV_WINDOW_TILE
+#define MPK_KV_WINDOW_TILE 64
+#endif
+  int *paged_kv_indptr_buffer[MPK_NUM_KV_GROUPS];    // Metadata for LLM serving
+                                                     // (paged attention)
+  int *paged_kv_indices_buffer[MPK_NUM_KV_GROUPS];   // Metadata for LLM serving
+                                                     // (paged attention)
+  int *paged_kv_indices_snapshot[MPK_NUM_KV_GROUPS]; // Scheduler snapshot for
+                                                     // in-place compaction
+  int *paged_kv_last_page_len_buffer[MPK_NUM_KV_GROUPS]; // Metadata for LLM
+                                                         // serving
+  int kv_group_block_sizes[MPK_NUM_KV_GROUPS];           // Set at init, used by
+                                                         // prepare_next_batch
+  // Sliding-window length in tokens per group, 0 = full attention.
+  int kv_group_window_sizes[MPK_NUM_KV_GROUPS];
+#ifdef MPK_KV_EVENT_LOG
+  // Allocator event debug log: [0] = record count, then 4-int records
+  // (type, group, row, page_id) with type 1=ALLOC, 2=FREE, 3=ITER. Written
+  // single-threaded from prepare_next_batch.
+  int *kv_event_log;
+#endif
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
     defined(MODE_ONLINE_NOTOKEN) || defined(MODE_ONLINE_TEST) ||               \
     defined(MODE_ONLINE_PINNED)
@@ -401,9 +422,10 @@ struct RuntimeConfig {
   // CPU→GPU shutdown signal: CPU writes 1 to request kernel termination.
   // GPU polls with ld.acquire.sys when the batch is empty.
   int32_t volatile *pinned_shutdown; // 0=running, 1=shutdown requested
-  // Per-request step progress: GPU writes after each decode step so CPU can
-  // poll for streaming output without touching GPU memory.
-  int32_t *pinned_step; // [total_inflight], pinned, indexed by buffer row
+  // Per-row progress and release handshake. GPU publishes a nonnegative decode
+  // step. After it reads completed output, CPU stores -1 to release the row.
+  int32_t volatile
+      *pinned_step; // [total_inflight], pinned, indexed by buffer row
   // Pinned inbox: CPU writes prompt tokens here before submitting a request
   // via the ring buffer. GPU copies from inbox to the allocated buffer row.
   int64_t *pinned_inbox_tokens; // [MPK_PINNED_RING_CAPACITY * max_seq_length],
@@ -411,7 +433,7 @@ struct RuntimeConfig {
   // Pinned rid→row mapping: GPU writes pinned_rid_at_row[row] = rid when
   // allocating a buffer row so CPU can discover which row its request is
   // on by scanning rows, then poll pinned_step[row] for per-step streaming.
-  int32_t *pinned_rid_at_row; // [total_inflight], pinned
+  int32_t volatile *pinned_rid_at_row; // [total_inflight], pinned
   // Running queue rid tracking: request_rids[i] stores the original rid
   // for active batch slot i (GPU device memory).
   int *request_rids; // [MPK_MAX_NUM_BATCHED_REQUESTS]
