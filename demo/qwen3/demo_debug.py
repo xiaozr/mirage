@@ -227,7 +227,7 @@ if __name__ == "__main__":
             max_num_batched_requests=args.max_num_batched_requests,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_pages=args.max_num_pages,
-            page_size=args.page_size,
+            kv_groups=[mi.mpk.kv_planner.KVGroupConfig(block_size=args.page_size)],
             eos_token_id=model.config.eos_token_id,
             meta_tensors={
                 "step": step,
@@ -237,9 +237,9 @@ if __name__ == "__main__":
                 "num_new_tokens": num_new_tokens,
                 "prompt_lengths": prompt_lengths,
                 "qo_indptr_buffer": qo_indptr_buffer,
-                "paged_kv_indptr_buffer": paged_kv_indptr_buffer,
-                "paged_kv_indices_buffer": paged_kv_indices_buffer,
-                "paged_kv_last_page_len_buffer": paged_kv_last_page_len_buffer,
+                "paged_kv_indptr_buffer_0": paged_kv_indptr_buffer,
+                "paged_kv_indices_buffer_0": paged_kv_indices_buffer,
+                "paged_kv_last_page_len_buffer_0": paged_kv_last_page_len_buffer,
             },
             profiler_tensor=profiler_tensor,
             trace_name=args.trace_name,
@@ -348,6 +348,7 @@ if __name__ == "__main__":
         # )
 
         mpk.paged_attention_split_kv_layer(
+            group_id=0,  # one group in this graph
             input=attn_in,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -362,6 +363,7 @@ if __name__ == "__main__":
         )
 
         mpk.paged_attention_split_kv_merge_layer(
+            group_id=0,  # one group in this graph
             lse=lse,
             output_tmp=attn_out_tmp,
             output=attn_out,
@@ -403,7 +405,7 @@ if __name__ == "__main__":
             max_num_batched_requests=args.max_num_batched_requests,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_pages=args.max_num_pages,
-            page_size=args.page_size,
+            kv_groups=[mi.mpk.kv_planner.KVGroupConfig(block_size=args.page_size)],
             eos_token_id=model.config.eos_token_id,
             meta_tensors={
                 "step": step.clone(),
@@ -413,9 +415,9 @@ if __name__ == "__main__":
                 "num_new_tokens": num_new_tokens.clone(),
                 "prompt_lengths": prompt_lengths.clone(),
                 "qo_indptr_buffer": qo_indptr_buffer_2,
-                "paged_kv_indptr_buffer": paged_kv_indptr_buffer_2,
-                "paged_kv_indices_buffer": paged_kv_indices_buffer_2,
-                "paged_kv_last_page_len_buffer": paged_kv_last_page_len_buffer_2,
+                "paged_kv_indptr_buffer_0": paged_kv_indptr_buffer_2,
+                "paged_kv_indices_buffer_0": paged_kv_indices_buffer_2,
+                "paged_kv_last_page_len_buffer_0": paged_kv_last_page_len_buffer_2,
             },
             profiler_tensor=profiler_tensor,
             trace_name=args.trace_name + "_96",
@@ -467,6 +469,7 @@ if __name__ == "__main__":
         # )
 
         mpk2.paged_attention_layer(
+            group_id=0,  # one group in this graph
             input=attn_in_2,
             k_cache=k_cache_2,
             v_cache=v_cache_2,
