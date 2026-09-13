@@ -160,6 +160,9 @@ enum TaskType {
   TASK_LINEAR_FP8_SM100 = 276,
   TASK_LINEAR_FP8_WITH_RESIDUAL_SM100 = 277,
   TASK_MLA_KV_GATHER_SM100 = 278,
+  // Per-chunk stage of temperature/top-k/top-p sampling. The reduce stage is a
+  // variant of TASK_SAMPLING_SM100.
+  TASK_SAMPLING_PARTIAL_SM100 = 279,
   TASK_MOE_TOPK_SIGMOID_SM100 = 280,
   TASK_ELEMENTWISE_ADD_SM100 = 281,
   TASK_SOFTMAX_GATHER_SM100 = 282,
@@ -355,6 +358,8 @@ struct RuntimeConfig {
 #ifndef MPK_NUM_KV_GROUPS
 #define MPK_NUM_KV_GROUPS 1
 #endif
+// A model with no paged KV declares zero groups.
+#define MPK_NUM_KV_GROUPS_ARRAY (MPK_NUM_KV_GROUPS > 0 ? MPK_NUM_KV_GROUPS : 1)
 // Tokens per KV tile in the windowed attention kernel.
 #ifndef MPK_KV_WINDOW_TILE
 #define MPK_KV_WINDOW_TILE 64
@@ -371,6 +376,10 @@ struct RuntimeConfig {
                                                          // prepare_next_batch
   // Sliding-window length in tokens per group, 0 = full attention.
   int kv_group_window_sizes[MPK_NUM_KV_GROUPS];
+  // Pages one request needs at max_seq_length, summed over every group.
+  // The admission gate keeps num_reqs * this <= MPK_MAX_NUM_PAGES so an
+  // admitted request can never be starved of pages later.
+  int kv_worst_case_pages_per_request;
 #ifdef MPK_KV_EVENT_LOG
   // Allocator event debug log: [0] = record count, then 4-int records
   // (type, group, row, page_id) with type 1=ALLOC, 2=FREE, 3=ITER. Written

@@ -92,7 +92,15 @@ if __name__ == "__main__":
         help="Not use the cutlass version kernel.",
     )
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore eos token during generation")
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--sampling-topk-max", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
     args = parser.parse_args()
+    if args.temperature <= 0.0:
+        parser.error("demo_sampling.py requires --temperature > 0")
     try:
         from mpi4py import MPI
         comm = MPI.COMM_WORLD
@@ -217,21 +225,16 @@ if __name__ == "__main__":
         else:
             profiler_tensor = None
             
-        spec_decode_config = mi.speculative.spec_decode_class(
+        spec_decode_config = mi.mpk.spec_decode_class(
             args.spec_decode,
             ngram_size=args.ngram_size,
             spec_length=args.spec_length,
         )
             
+        kv_plan = model.model.kv_plan
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
         qo_indptr_buffer = torch.empty(
             args.max_num_batched_requests + 1, dtype=torch.int32, device="cuda")
-        paged_kv_indptr_buffer = torch.empty(
-            args.max_num_batched_requests + 1, dtype=torch.int32, device="cuda")
-        paged_kv_indices_buffer = torch.empty(
-            args.max_num_pages, dtype=torch.int32, device="cuda")
-        paged_kv_last_page_len_buffer = torch.empty(
-            args.max_num_batched_requests, dtype=torch.int32, device="cuda")
         mpk = mi.PersistentKernel(
             mode="offline",
             world_size=world_size,
@@ -242,8 +245,7 @@ if __name__ == "__main__":
             max_seq_length=args.max_seq_length,
             max_num_batched_requests=args.max_num_batched_requests,
             max_num_batched_tokens=args.max_num_batched_tokens,
-            max_num_pages=args.max_num_pages,
-            page_size=args.page_size,
+            kv_plan=kv_plan,
             eos_token_id=model.config.eos_token_id if not args.ignore_eos else -1,
             meta_tensors={
                 "step": step,
@@ -253,9 +255,9 @@ if __name__ == "__main__":
                 "num_new_tokens": num_new_tokens,
                 "prompt_lengths": prompt_lengths,
                 "qo_indptr_buffer": qo_indptr_buffer,
-                "paged_kv_indptr_buffer": paged_kv_indptr_buffer,
-                "paged_kv_indices_buffer": paged_kv_indices_buffer,
-                "paged_kv_last_page_len_buffer": paged_kv_last_page_len_buffer,
+                **kv_plan.build_meta_tensors(
+                    max_seq_length=args.max_seq_length,
+                    max_num_batched_requests=args.max_num_batched_requests),
             },
             profiler_tensor=profiler_tensor,
             trace_name=args.trace_name,
@@ -354,6 +356,20 @@ if __name__ == "__main__":
             name="argmax_in",
             io_category="cuda_tensor",
         )
+        sampling_part_value = mpk.new_tensor(
+            dims=(args.max_num_batched_tokens,
+                  mpk.num_workers * (args.sampling_topk_max + 2)),
+            dtype=mi.float32,
+            name="sampling_part_value",
+            io_category="cuda_tensor",
+        )
+        sampling_part_index = mpk.new_tensor(
+            dims=(args.max_num_batched_tokens,
+                  mpk.num_workers * args.sampling_topk_max),
+            dtype=mi.int64,
+            name="sampling_part_index",
+            io_category="cuda_tensor",
+        )
         argmax_out = mpk.attach_input(torch_tensor=output_tokens, name="output_token")
         # add spec tokens layer
         if spec_decode_config:
@@ -429,12 +445,8 @@ if __name__ == "__main__":
             w_k_norm = mpk.attach_input(
                 torch_tensor=layer.self_attn.k_norm.weight, name=f"layer_{i}_k_norm"
             )
-            k_cache = mpk.attach_input(
-                torch_tensor=model.model.kv_cache[0][i], name=f"layer_{i}_k_cache"
-            )
-            v_cache = mpk.attach_input(
-                torch_tensor=model.model.kv_cache[1][i], name=f"layer_{i}_v_cache"
-            )
+            kv = kv_plan.attach(mpk, i)
+            k_cache, v_cache = kv["k_cache"], kv["v_cache"]
             # TODO: Later attention kernels should be merged as one
             if spec_decode_config:
                 mpk.single_batch_extend_attention_layer(
@@ -451,6 +463,7 @@ if __name__ == "__main__":
                 )
             else:
                 mpk.paged_attention_layer(
+                    group_id=kv["group_id"],
                     input=attn_in,
                     k_cache=k_cache,
                     v_cache=v_cache,
@@ -584,13 +597,25 @@ if __name__ == "__main__":
         #    block_dim=(128, 1, 1),
         #)
 
-        # Add sampling layer
-        mpk.sampling_sm100_layer(
-            logits=argmax_in,
+        # Temperature / top-k / top-p sampling (SM100 two-stage path).
+        mpk.sampling_partial_layer(
+            input=argmax_in,
+            output=(sampling_part_value, sampling_part_index),
+            grid_dim=(mpk.num_workers, 1, 1),
+            block_dim=(128, 1, 1),
+            vocab_size=model.config.vocab_size,
+            topk_max=args.sampling_topk_max,
+            temperature=args.temperature,
+        )
+        mpk.sampling_reduce_layer(
+            input=(sampling_part_value, sampling_part_index),
             output=argmax_out,
-            grid_dim=(args.max_num_batched_tokens, 1, 1),
-            block_dim=(256, 1, 1),
-            seed=random.randint(0, 2**31 - 1),
+            grid_dim=(1, 1, 1),
+            block_dim=(128, 1, 1),
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            seed=args.seed,
         )
         if spec_decode_config:
             verify_out = mpk.verify_layer_dispatcher(

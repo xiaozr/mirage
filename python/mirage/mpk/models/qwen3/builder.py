@@ -3,18 +3,30 @@ import torch
 
 from ..utils import grid_for_rmsnorm_linear_layer, grid_for_splitk_linear_layer, shuffle_tensors, inplace_shuffle_tensors
 from ..graph_builder import GraphBuilder, MirageModelConfig
+from ...kvcache import KVStream
 from ...persistent_kernel import PersistentKernel
 from ...model_registry import register_model_builder
-from ....core import bfloat16, int64
+from ....core import bfloat16, int64, float32
 
 from typing import Optional
 
+def qwen3_kv_streams(config, world_size: int = 1):
+    """Qwen3 stores one type of KV, so it is a single stream over every layer."""
+    entry_shape = (config.num_key_value_heads // world_size, config.head_dim)
+    return [
+        KVStream("attention",
+                 layers=tuple(range(config.num_hidden_layers)),
+                 components=[("k", entry_shape, torch.bfloat16),
+                             ("v", entry_shape, torch.bfloat16)]),
+    ]
+
+
 @register_model_builder("Qwen3", "Qwen/Qwen3-8B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-14B", "Qwen/Qwen3-32B", "Qwen/Qwen3-0.6B", "Qwen/Qwen3.5-0.8B", "Qwen3.5-0.8B")
 class Qwen3Builder(GraphBuilder):
+    kv_streams = staticmethod(qwen3_kv_streams)
+
     def __init__(self, mpk: PersistentKernel, weights: Optional[dict] = None):
         super().__init__(mpk, weights)
-        self.max_num_pages = mpk.max_num_pages
-        self.page_size = mpk.page_size
         self.world_size = mpk.world_size
         self.input_tokens = mpk.meta_tensors["input_tokens"]
         self.output_tokens = mpk.meta_tensors["output_tokens"]
@@ -24,13 +36,17 @@ class Qwen3Builder(GraphBuilder):
         self.shuffled_tensors = {}
         self.rank = mpk.mpi_rank
         self.eos_token_id = 151645 # default eos token id for Qwen3
+        self.do_sample = getattr(mpk, "do_sample", False)
+        self.temperature = getattr(mpk, "temperature", 0.0)
+        self.top_p = getattr(mpk, "top_p", 1.0)
+        self.top_k = getattr(mpk, "top_k", 0)
+        self.sampling_seed = getattr(mpk, "sampling_seed", 42)
+        self.sampling_topk_max = getattr(mpk, "sampling_topk_max", 32)
 
     def build_from_config(self, 
                               model_config: MirageModelConfig):
         self.position_embeddings = model_config.position_embeddings
         
-        self.k_cache = model_config.k_cache # (num_layers, max_num_pages, page_size, num_kv_heads // world_size, head_dim)
-        self.v_cache = model_config.v_cache # (num_layers, max_num_pages, page_size, num_kv_heads // world_size, head_dim)
         
         self.hidden_size = model_config.hidden_size
         self.intermediate_size = model_config.intermediate_size
@@ -84,28 +100,7 @@ class Qwen3Builder(GraphBuilder):
         
         self.num_layers = len(self.model.model.layers)
         
-        self.k_cache = torch.empty(
-            (
-                self.num_layers,
-                self.max_num_pages,
-                self.page_size,
-                self.num_local_kv_heads,
-                self.head_dim,
-            ),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        self.v_cache = torch.empty(
-            (
-                self.num_layers,
-                self.max_num_pages,
-                self.page_size,
-                self.num_local_kv_heads,
-                self.head_dim,
-            ),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
+        assert getattr(self.mpk, "kv_plan", None) is not None
         
         print(f"build_from_model: Model name: {self.model_name}, num_layers: {self.num_layers}, hidden_size: {self.hidden_size}, intermediate_size: {self.intermediate_size}, vocab_size: {self.vocab_size}, num_q_heads: {self.num_q_heads}, num_kv_heads: {self.num_kv_heads}, num_local_q_heads: {self.num_local_q_heads}, num_local_kv_heads: {self.num_local_kv_heads}, head_dim: {self.head_dim}, fused_outdim_1: {self.fused_outdim_1}, fused_outdim_2: {self.fused_outdim_2}")
         
@@ -155,12 +150,26 @@ class Qwen3Builder(GraphBuilder):
             if self.mpk.mode != "online_notoken":
                 self.argmax_in_tensor = torch.zeros(self.max_num_batched_tokens, self.padded_vocab_size, dtype=torch.bfloat16, device="cuda")
                 self.argmax_in = self.mpk.attach_input(torch_tensor=self.argmax_in_tensor, name="argmax_in")
-                
-                self.argmax_part_value_tensor = torch.zeros(self.max_num_batched_tokens, self.mpk.num_workers, dtype=torch.bfloat16, device="cuda")
-                self.argmax_part_value = self.mpk.attach_input(torch_tensor=self.argmax_part_value_tensor, name="argmax_part_value")
-                
-                self.argmax_part_index_tensor = torch.zeros(self.max_num_batched_tokens, self.mpk.num_workers, dtype=torch.int64, device="cuda")
-                self.argmax_part_index = self.mpk.attach_input(torch_tensor=self.argmax_part_index_tensor, name="argmax_part_index")
+                if self.do_sample:
+                    self.sampling_part_value_tensor = torch.zeros(
+                        self.max_num_batched_tokens,
+                        self.mpk.num_workers * (self.sampling_topk_max + 2),
+                        dtype=torch.float32, device="cuda")
+                    self.sampling_part_value = self.mpk.attach_input(
+                        torch_tensor=self.sampling_part_value_tensor,
+                        name="sampling_part_value")
+                    self.sampling_part_index_tensor = torch.zeros(
+                        self.max_num_batched_tokens,
+                        self.mpk.num_workers * self.sampling_topk_max,
+                        dtype=torch.int64, device="cuda")
+                    self.sampling_part_index = self.mpk.attach_input(
+                        torch_tensor=self.sampling_part_index_tensor,
+                        name="sampling_part_index")
+                else:
+                    self.argmax_part_value_tensor = torch.zeros(self.max_num_batched_tokens, self.mpk.num_workers, dtype=torch.bfloat16, device="cuda")
+                    self.argmax_part_value = self.mpk.attach_input(torch_tensor=self.argmax_part_value_tensor, name="argmax_part_value")
+                    self.argmax_part_index_tensor = torch.zeros(self.max_num_batched_tokens, self.mpk.num_workers, dtype=torch.int64, device="cuda")
+                    self.argmax_part_index = self.mpk.attach_input(torch_tensor=self.argmax_part_index_tensor, name="argmax_part_index")
 
         else:
             self.y = self.mpk.new_tensor(
@@ -236,18 +245,34 @@ class Qwen3Builder(GraphBuilder):
                     name="argmax_in",
                     io_category="cuda_tensor",
                 )
-                self.argmax_part_value = self.mpk.new_tensor(
-                    dims=(self.max_num_batched_tokens, self.mpk.num_workers),
-                    dtype=bfloat16,
-                    name="argmax_part_value",
-                    io_category="cuda_tensor",
-                )
-                self.argmax_part_index = self.mpk.new_tensor(
-                    dims=(self.max_num_batched_tokens, self.mpk.num_workers),
-                    dtype=int64,
-                    name="argmax_part_index",
-                    io_category="cuda_tensor",
-                )
+                if self.do_sample:
+                    self.sampling_part_value = self.mpk.new_tensor(
+                        dims=(self.max_num_batched_tokens,
+                              self.mpk.num_workers * (self.sampling_topk_max + 2)),
+                        dtype=float32,
+                        name="sampling_part_value",
+                        io_category="cuda_tensor",
+                    )
+                    self.sampling_part_index = self.mpk.new_tensor(
+                        dims=(self.max_num_batched_tokens,
+                              self.mpk.num_workers * self.sampling_topk_max),
+                        dtype=int64,
+                        name="sampling_part_index",
+                        io_category="cuda_tensor",
+                    )
+                else:
+                    self.argmax_part_value = self.mpk.new_tensor(
+                        dims=(self.max_num_batched_tokens, self.mpk.num_workers),
+                        dtype=bfloat16,
+                        name="argmax_part_value",
+                        io_category="cuda_tensor",
+                    )
+                    self.argmax_part_index = self.mpk.new_tensor(
+                        dims=(self.max_num_batched_tokens, self.mpk.num_workers),
+                        dtype=int64,
+                        name="argmax_part_index",
+                        io_category="cuda_tensor",
+                    )
         
     def build_layers(self, 
                      state_dict: dict):
@@ -337,13 +362,8 @@ class Qwen3Builder(GraphBuilder):
             w_k_norm = self.mpk.attach_input(
                 torch_tensor=state_dict[f"{prefix}self_attn.k_norm.weight"], name=f"layer_{i}_k_norm"
             )
-            # TODO: KV cache handling
-            k_cache = self.mpk.attach_input(
-                torch_tensor=self.k_cache[i], name=f"layer_{i}_k_cache"
-            )
-            v_cache = self.mpk.attach_input(
-                torch_tensor=self.v_cache[i], name=f"layer_{i}_v_cache"
-            )
+            kv = self.mpk.kv_plan.attach(self.mpk, i)
+            k_cache, v_cache = kv["k_cache"], kv["v_cache"]
             
             # TODO(Jianan Ji): spec_decode_config handling (see previous implementation)
             # if spec_decode_config:
@@ -364,6 +384,7 @@ class Qwen3Builder(GraphBuilder):
                 input=self.attn_in,
                 k_cache=k_cache,
                 v_cache=v_cache,
+                group_id=kv["group_id"],
                 q_norm=w_q_norm,
                 k_norm=w_k_norm,
                 cos_pos_embed=self.cos_pos_embed,
@@ -607,29 +628,42 @@ class Qwen3Builder(GraphBuilder):
                 block_dim=(128, 1, 1),
             )
 
-            # add argmax layer
-            # TODO(Jianan Ji): spec_decode_config handling (see previous implementation)
-            # if spec_decode_config and spec_decode_config.method == "promptlookup":
-            #     argmax_partial_grid_dim = (max_factor_leq_n(153600, 96 // (spec_decode_config.spec_length + 1)), 
-            #                                spec_decode_config.spec_length + 1, 
-            #                                1)
-            #     argmax_reduce_grid_dim = (1, spec_decode_config.spec_length + 1, 1)
-            # else:
-            argmax_partial_grid_dim = (self.mpk.num_workers, 1, 1)
-            argmax_reduce_grid_dim = (1, 1, 1)
-            self.mpk.argmax_partial_layer(
-                input=self.argmax_in,
-                output=(self.argmax_part_value, self.argmax_part_index),
-                grid_dim=argmax_partial_grid_dim,
-                block_dim=(128, 1, 1),
-                vocab_size=self.vocab_size,
-            )
-            self.mpk.argmax_reduce_layer(
-                input=(self.argmax_part_value, self.argmax_part_index),
-                output=argmax_out,
-                grid_dim=argmax_reduce_grid_dim,
-                block_dim=(128, 1, 1),
-            )
+            # Decode: greedy argmax, or temperature/top-k/top-p sampling when
+            # PersistentKernel was constructed with do_sample=True.
+            if self.do_sample:
+                self.mpk.sampling_partial_layer(
+                    input=self.argmax_in,
+                    output=(self.sampling_part_value, self.sampling_part_index),
+                    grid_dim=(self.mpk.num_workers, 1, 1),
+                    block_dim=(128, 1, 1),
+                    vocab_size=self.vocab_size,
+                    topk_max=self.sampling_topk_max,
+                    temperature=self.temperature,
+                )
+                self.mpk.sampling_reduce_layer(
+                    input=(self.sampling_part_value, self.sampling_part_index),
+                    output=argmax_out,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(128, 1, 1),
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                    seed=self.sampling_seed,
+                )
+            else:
+                self.mpk.argmax_partial_layer(
+                    input=self.argmax_in,
+                    output=(self.argmax_part_value, self.argmax_part_index),
+                    grid_dim=(self.mpk.num_workers, 1, 1),
+                    block_dim=(128, 1, 1),
+                    vocab_size=self.vocab_size,
+                )
+                self.mpk.argmax_reduce_layer(
+                    input=(self.argmax_part_value, self.argmax_part_index),
+                    output=argmax_out,
+                    grid_dim=(1, 1, 1),
+                    block_dim=(128, 1, 1),
+                )
             # TODO(Jianan Ji): spec_decode_config handling (see previous implementation)
             # if spec_decode_config:
             #     verify_out = self.mpk.verify_layer_dispatcher(
