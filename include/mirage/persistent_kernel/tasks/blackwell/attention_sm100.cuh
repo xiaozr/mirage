@@ -54,7 +54,9 @@ template <typename T,
           int ROTARY_DIM = HEAD_DIM,
           // Sliding-window attention. A query at absolute position p attends
           // to keys in (p - WINDOW_SIZE, p]. 0 = no window.
-          int WINDOW_SIZE = 0>
+          int WINDOW_SIZE = 0,
+          // Rows between consecutive pages. 0 = packed layout.
+          int PAGE_STRIDE_ROWS = 0>
 __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     void const *qkv_ptr,
     void *paged_k_cache_ptr,
@@ -78,6 +80,9 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     void const *sink_ptr = nullptr) {
   constexpr int CONSUMER_WARPGROUP_SYNC_BARRIER_ID = 6;
   constexpr int ROTARY_SYNC_BARRIER_ID = 7;
+  // Stride between consecutive pages of K or V.
+  constexpr int PAGE_STRIDE =
+      PAGE_STRIDE_ROWS > 0 ? PAGE_STRIDE_ROWS : PAGE_SIZE;
   cutlass::arch::NamedBarrier wg_barrier(
       NUM_THREADS, /*bar-id*/ CONSUMER_WARPGROUP_SYNC_BARRIER_ID);
   if (threadIdx.x < NUM_THREADS) {
@@ -273,7 +278,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
         // int page_idx = page_indices[(dst_row + cp_finished_seq_len) /
         // PAGE_SIZE];
         int page_offset = (dst_row + cp_finished_seq_len) % PAGE_SIZE;
-        int src_row = page_idx_0 * PAGE_SIZE + page_offset;
+        int src_row = page_idx_0 * PAGE_STRIDE + page_offset;
         load_smem(k_buffer_smem(dst_row, col),
                   paged_k_cache_dmem(src_row, col));
         load_smem(v_buffer_smem(dst_row, col),
@@ -315,11 +320,9 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
                               : 0;
       if (next_iter_len > 0) {
         int page_idx = page_indices[cp_finished_seq_len / PAGE_SIZE];
-        // FIX: loop bound was `curr_iter_len` (stale first-iter value); should
-        // be `next_iter_len` (the tile being loaded). The original OOB-read
-        // QKV input for `dst_row >= next_iter_len`, which lands in
-        // unmapped memory at higher mbt values → illegal access. See plan
-        // /home/letianr/.claude/plans/mpk-eagle3-k-greater-than-1-chain-flow.md
+        // Prefetch bound must be next_iter_len (tile being loaded), not
+        // curr_iter_len (tile being consumed). Using the stale first-iter
+        // length OOBs into QKV when next_iter_len < curr_iter_len (#698/#692).
 #pragma unroll
         for (int chunk_idx = threadIdx.x;
              chunk_idx < next_iter_len * HEAD_DIM / CP_CHUNK_SIZE;
@@ -331,7 +334,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
             // int page_idx =
             //    page_indices[(dst_row + cp_finished_seq_len) / PAGE_SIZE];
             int page_offset = (dst_row + cp_finished_seq_len) % PAGE_SIZE;
-            int src_row = page_idx * PAGE_SIZE + page_offset;
+            int src_row = page_idx * PAGE_STRIDE + page_offset;
             load_smem(k_smem(dst_row, col), paged_k_cache_dmem(src_row, col));
             load_smem(v_smem(dst_row, col), paged_v_cache_dmem(src_row, col));
           } else {
@@ -468,7 +471,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
           // / PAGE_SIZE];
           int page_offset = (token_idx + first_kv_token_to_process) % PAGE_SIZE;
           int src_row = (token_idx + first_kv_token_to_process) % KV_TILE_SIZE;
-          int dst_row = page_idx * PAGE_SIZE + page_offset;
+          int dst_row = page_idx * PAGE_STRIDE + page_offset;
           paged_k_cache_dmem.at(dst_row, col) = k_smem.at(src_row, col);
           paged_v_cache_dmem.at(dst_row, col) = v_smem.at(src_row, col);
         }

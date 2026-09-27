@@ -48,7 +48,9 @@ template <typename T,
           // Partial RoPE (GLM-4.6: 64 of 128 dims). Rotates dims
           // [0, ROTARY_DIM), passes the rest through; cos/sin tables are
           // [max_seq_len, ROTARY_DIM]. Default = full-dim NeoX RoPE.
-          int ROTARY_DIM = HEAD_DIM>
+          int ROTARY_DIM = HEAD_DIM,
+          // Rows between consecutive pages. 0 = packed layout.
+          int PAGE_STRIDE_ROWS = 0>
 __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
     void *paged_k_cache_ptr,
     void *paged_v_cache_ptr,
@@ -69,6 +71,9 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
     void *output_ptr,
     void *lse = nullptr,
     int kv_idx = 0) {
+  // Stride between consecutive pages of K or V.
+  constexpr int PAGE_STRIDE =
+      PAGE_STRIDE_ROWS > 0 ? PAGE_STRIDE_ROWS : PAGE_SIZE;
   constexpr int NUM_QO_PER_KV = NUM_QO_HEADS / NUM_KV_HEADS;
 
   constexpr int KV_TILE_SIZE = 64;
@@ -314,16 +319,21 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
     int page_idx_0 = page_indices[kv_cache_offset / PAGE_SIZE];
 #pragma unroll
     for (int chunk_idx = threadIdx.x - NUM_THREADS * CONSUMER_WARPGROUPS;
-         chunk_idx < curr_iter_len * HEAD_DIM / CP_CHUNK_SIZE;
+         chunk_idx < KV_TILE_SIZE * HEAD_DIM / CP_CHUNK_SIZE;
          chunk_idx += NUM_THREADS) {
       int dst_row = chunk_idx / (HEAD_DIM / CP_CHUNK_SIZE);
       int col = (chunk_idx % (HEAD_DIM / CP_CHUNK_SIZE)) * CP_CHUNK_SIZE;
-      if (dst_row + kv_cache_offset < global_seq_len - num_tokens) {
+      if (dst_row >= curr_iter_len) {
+        // P @ V still reads the entire tile after masking P. Zero the tail:
+        // a masked probability of zero does not suppress a stale NaN in V.
+        load_smem_with_predict(k_buffer_smem(dst_row, col), k_dmem(0, 0), false);
+        load_smem_with_predict(v_buffer_smem(dst_row, col), v_dmem(0, 0), false);
+      } else if (dst_row + kv_cache_offset < global_seq_len - num_tokens) {
         // load from KV Cache
         // int page_idx = page_indices[(dst_row + cp_finished_seq_len) /
         // PAGE_SIZE];
         int page_offset = (dst_row + kv_cache_offset) % PAGE_SIZE;
-        int src_row = page_idx_0 * PAGE_SIZE + page_offset;
+        int src_row = page_idx_0 * PAGE_STRIDE + page_offset;
         load_smem(k_buffer_smem(dst_row, col),
                   paged_k_cache_dmem(src_row, col));
         load_smem(v_buffer_smem(dst_row, col),
@@ -337,6 +347,10 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
     }
     cp_async_fence();
     cp_async_wait<0>();
+
+    // Each producer must finish its copies before warp 4 publishes the tile.
+    wg_sync<THREADS_PER_WARPGROUP * PRODUCER_WARPGROUPS>(
+        PRODUCER_WARPGROUP_SYNC_BARRIER_ID);
 
     if (lane_idx == 0 && warp_idx % 4 == 0) {
       arrive(k_barrier[0], 1);
@@ -357,11 +371,14 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
         int page_idx = page_indices[(iter + 1) * KV_TILE_SIZE / PAGE_SIZE];
 #pragma unroll
         for (int chunk_idx = threadIdx.x - NUM_THREADS * CONSUMER_WARPGROUPS;
-             chunk_idx < next_iter_len * HEAD_DIM / CP_CHUNK_SIZE;
+             chunk_idx < KV_TILE_SIZE * HEAD_DIM / CP_CHUNK_SIZE;
              chunk_idx += NUM_THREADS) {
           int dst_row = chunk_idx / (HEAD_DIM / CP_CHUNK_SIZE);
           int col = (chunk_idx % (HEAD_DIM / CP_CHUNK_SIZE)) * CP_CHUNK_SIZE;
-          if (dst_row + (iter + 1) * KV_TILE_SIZE + kv_cache_offset <
+          if (dst_row >= next_iter_len) {
+            load_smem_with_predict(k_smem(dst_row, col), k_dmem(0, 0), false);
+            load_smem_with_predict(v_smem(dst_row, col), v_dmem(0, 0), false);
+          } else if (dst_row + (iter + 1) * KV_TILE_SIZE + kv_cache_offset <
               global_seq_len - num_tokens) {
             // load from KV Cache
             // int page_idx =
@@ -369,7 +386,7 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
             int page_offset =
                 (dst_row + (iter + 1) * KV_TILE_SIZE + kv_cache_offset) %
                 PAGE_SIZE;
-            int src_row = page_idx * PAGE_SIZE + page_offset;
+            int src_row = page_idx * PAGE_STRIDE + page_offset;
             load_smem(k_smem(dst_row, col), paged_k_cache_dmem(src_row, col));
             load_smem(v_smem(dst_row, col), paged_v_cache_dmem(src_row, col));
           } else {
@@ -563,7 +580,7 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
               (token_idx + first_kv_token_to_process + kv_cache_offset) %
               PAGE_SIZE;
           int src_row = (token_idx + first_kv_token_to_process) % KV_TILE_SIZE;
-          int dst_row = page_idx * PAGE_SIZE + page_offset;
+          int dst_row = page_idx * PAGE_STRIDE + page_offset;
           paged_k_cache_dmem.at(dst_row, col) = k_smem.at(src_row, col);
           paged_v_cache_dmem.at(dst_row, col) = v_smem.at(src_row, col);
         }
@@ -721,8 +738,9 @@ __device__ __forceinline__ void multitoken_paged_attention_hopper_impl(
         }
       }
     }
-    // wg_sync<THREADS_PER_WARPGROUP * CONSUMER_WARPGROUPS>(
-    //     CONSUMER_WARPGROUP_SYNC_BARRIER_ID);
+    // The output gather below reads fragments written by other warps.
+    wg_sync<THREADS_PER_WARPGROUP * CONSUMER_WARPGROUPS>(
+        CONSUMER_WARPGROUP_SYNC_BARRIER_ID);
 
     // get global m, d, and o
     // each thread handles an element in o in each iteration

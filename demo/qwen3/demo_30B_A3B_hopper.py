@@ -52,7 +52,7 @@ def max_factor_leq_n(m: int, n: int) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
-    parser.add_argument("--max-num-batched-tokens", default=1, type=int, help="Max number of tokens in a batch")
+    parser.add_argument("--max-num-batched-tokens", default=8, type=int, help="Max number of tokens in a batch")
     parser.add_argument("--max-num-batched-requests", default=1, type=int, help="Max number of requests in a batch")
     parser.add_argument("--page-size", default=4096, type=int, help="Page size")
     parser.add_argument("--max-num-pages", default=16, type=int, help="Max num pages")
@@ -732,6 +732,7 @@ if __name__ == "__main__":
             output=(argmax_part_value, argmax_part_index),
             grid_dim=argmax_partial_grid_dim,
             block_dim=(256, 1, 1),
+            vocab_size=model.config.vocab_size,
         )
         mpk.argmax_reduce_layer(
             input=(argmax_part_value, argmax_part_index),

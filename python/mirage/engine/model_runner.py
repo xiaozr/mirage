@@ -46,6 +46,14 @@ class RunnerConfig:
 
     use_cutlass_kernel: bool = True
 
+    # Compile-time sampling config (one setting per server process).
+    do_sample: bool = False
+    temperature: float = 0.8
+    top_p: float = 0.95
+    top_k: int = 20
+    sampling_seed: int = 42
+    sampling_topk_max: int = 32
+
 
 # ── ModelRunner ───────────────────────────────────────────────────────────────
 
@@ -90,6 +98,12 @@ class ModelRunner:
             model_path=config.model_path,
             model_config=MirageModelConfig(with_lm_head=True),
             use_cutlass_kernel=config.use_cutlass_kernel,
+            do_sample=config.do_sample,
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            sampling_seed=config.sampling_seed,
+            sampling_topk_max=config.sampling_topk_max,
             **self.meta_tensors,
         )
         self.mpk = MPK(mpk_meta)
@@ -101,14 +115,16 @@ class ModelRunner:
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def __call__(self) -> None:
-        """Launch the MPK persistent kernel.
+        """Launch the MPK kernel and block until runtime shutdown completes.
 
-        Blocks until all requests submitted to the ring buffer have been
-        processed.  Intended to run in a background thread so the main thread
-        can concurrently submit requests and poll completions via
-        :attr:`runtime`.
+        Intended to run in a background thread so the main thread can submit
+        requests and poll completions through :attr:`runtime`.
         """
         self.mpk()
+        # The split worker/scheduler launch is asynchronous. Keep this Python
+        # thread alive until both GPU streams exit so LLMEngine.close() can
+        # safely join it before stopping completion draining or freeing state.
+        self.mpk.persistent_kernel.wait()
 
     # ── Private helpers ───────────────────────────────────────────────────────
 

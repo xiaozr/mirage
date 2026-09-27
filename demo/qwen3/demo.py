@@ -1,4 +1,4 @@
-from models.modeling_qwen3 import Qwen3ForCausalLM
+from models.modeling_qwen3 import Qwen3ForCausalLM, plan_qwen3_kv_cache
 from transformers import AutoTokenizer, AutoConfig
 from safetensors.torch import load_model
 import torch
@@ -9,6 +9,7 @@ import os, json
 from models.qwen3_shard_loader import Qwen3ShardLoader
 from mirage.mpk.base_dynamic_shard_loader import ShardType
 from mirage.mpk.models.utils import grid_for_splitk_linear_layer
+from mirage.mpk.kv_planner import resolve_pool_size
 
 
 mapping = {
@@ -72,8 +73,10 @@ if __name__ == "__main__":
     parser.add_argument("--use-mirage", action="store_true", help="Use Mirage kernels")
     parser.add_argument("--max-num-batched-tokens", default=8, type=int, help="Max number of tokens in a batch")
     parser.add_argument("--max-num-batched-requests", default=1, type=int, help="Max number of requests in a batch")
-    parser.add_argument("--page-size", default=4096, type=int, help="Page size")
-    parser.add_argument("--max-num-pages", default=16, type=int, help="Max num pages")
+    parser.add_argument("--page-size", default=4096, type=int, help="Tokens per page")
+    parser.add_argument("--kv-budget", type=str, default=None,
+                        help="Memory budget for KV cache as a size('24GiB'). Exclusive with --max-num-pages")
+    parser.add_argument("--max-num-pages", default=16, type=int, help="Max num pages. Exclusive with --kv-budget")
     parser.add_argument("--output-dir", help="Output files directory")
     parser.add_argument("--trace-name", default="", help="Perfetto trace output name")
     parser.add_argument(
@@ -123,6 +126,17 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--do-sample", dest="do_sample", action="store_true", help="Enable sampling (default off)")
+    parser.add_argument("--top_k", type=int, default=0, help="Keep only the top_k logits when sampling (0 disables)")
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed for sampling")
+    parser.add_argument(
+        "--sampling-topk-max",
+        type=int,
+        default=32,
+        help=(
+            "Candidates kept per vocabulary chunk when sampling. Upper bound "
+            "on --top_k and on the nucleus size that can be served exactly."
+        ),
+    )
     parser.add_argument(
         "--save-tokens",
         nargs="?",
@@ -141,6 +155,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--split-kv-cache", action="store_true", help="Use split-kv cache")
     args = parser.parse_args()
+    if args.do_sample and args.temperature <= 0.0:
+        parser.error("--do-sample needs --temperature > 0 "
+                     "(temperature 0 is greedy decoding, i.e. no --do-sample)")
     try:
         from mpi4py import MPI
         comm = MPI.COMM_WORLD
@@ -176,26 +193,46 @@ if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
 
     torch.cuda.set_device(rank)
+
+    kv_plan = plan_qwen3_kv_cache(
+        AutoConfig.from_pretrained(args.model_path or model_name),
+        world_size, args.page_size)
+    try:
+        max_num_pages = resolve_pool_size(
+            kv_plan, kv_budget=args.kv_budget,
+            max_num_pages=None if args.kv_budget else args.max_num_pages,
+            max_seq_length=args.max_seq_length,
+            max_num_batched_requests=args.max_num_batched_requests,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            device=rank, verbose=args.use_mirage)
+    except ValueError as e:
+        raise SystemExit(str(e))
+
     if args.model_path is not None or world_size == 1:
       with torch.device("cuda"):
           if args.model_path is not None:
               # load model locally (necessary for multi-GPU case)
               print(f"Load model from model path: {args.model_path}")
               config = AutoConfig.from_pretrained(args.model_path)
-              model = Qwen3ForCausalLM(config, world_size, args.max_num_pages, args.page_size)
+              model = Qwen3ForCausalLM(config, world_size, max_num_pages, args.page_size, kv_plan=kv_plan)
               load_model(
                   model, f"{args.model_path}/model{rank}-mp{world_size}.safetensors"
               )
               # model = Qwen3ForCausalLM.from_pretrained(args.model_path, world_size, max_num_pages=args.max_num_pages, page_size=args.page_size).to("cuda")
               tokenizer = AutoTokenizer.from_pretrained(args.model_path)
           else:
-              model = Qwen3ForCausalLM.from_pretrained(model_name, world_size, max_num_pages=args.max_num_pages, page_size=args.page_size).to("cuda")
+              # No kv_plan here: from_pretrained serialises unknown kwargs
+              # through GenerationConfig, which a plan does not survive. The
+              # constructor rebuilds one from the same config.
+              model = Qwen3ForCausalLM.from_pretrained(
+                  model_name, world_size, max_num_pages=max_num_pages,
+                  page_size=args.page_size).to("cuda")
               tokenizer = AutoTokenizer.from_pretrained(model_name)
     else: # Use dynamic shard loader to load directly from HF and shard.
         print("Detected multi-GPU run without a local path specified. Will use the DynamicShardLoader class.")
         with torch.device("meta"):
             config = AutoConfig.from_pretrained(model_name)
-            model = Qwen3ForCausalLM(config, world_size, args.max_num_pages, args.page_size)
+            model = Qwen3ForCausalLM(config, world_size, max_num_pages, args.page_size, kv_plan=kv_plan)
 
         device = torch.device(f"cuda:{rank}")
         loader = Qwen3ShardLoader(model, model_name, mapping, rank, world_size, device)
@@ -203,6 +240,10 @@ if __name__ == "__main__":
 
         with torch.device("cuda"):
             tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Adopt whichever plan the model ended up holding, so exactly one is live.
+    kv_plan = model.model.kv_plan
+    kv_plan.max_num_pages = max_num_pages
 
     total_num_requests = 1 if not args.use_mirage else args.max_num_batched_requests
     # get all model weight tensors
@@ -297,14 +338,12 @@ if __name__ == "__main__":
         )
             
         num_workers, num_schedulers = mi.get_configurations_from_gpu(rank)
+        # Create auxiliary buffers for paged (with kv_plan builder) KV and QO
         qo_indptr_buffer = torch.empty(
             args.max_num_batched_requests + 1, dtype=torch.int32, device="cuda")
-        paged_kv_indptr_buffer = torch.empty(
-            args.max_num_batched_requests + 1, dtype=torch.int32, device="cuda")
-        paged_kv_indices_buffer = torch.empty(
-            args.max_num_pages, dtype=torch.int32, device="cuda")
-        paged_kv_last_page_len_buffer = torch.empty(
-            args.max_num_batched_requests, dtype=torch.int32, device="cuda")
+        kv_meta_tensors = kv_plan.build_meta_tensors(
+            max_num_batched_requests=args.max_num_batched_requests,
+            max_seq_length=args.max_seq_length)
         mpk = mi.PersistentKernel(
             mode="offline",
             world_size=world_size,
@@ -315,8 +354,8 @@ if __name__ == "__main__":
             max_seq_length=args.max_seq_length,
             max_num_batched_requests=args.max_num_batched_requests,
             max_num_batched_tokens=args.max_num_batched_tokens,
-            max_num_pages=args.max_num_pages,
-            page_size=args.page_size,
+            max_num_pages=max_num_pages,
+            kv_groups=kv_plan.group_specs(),
             eos_token_id=model.config.eos_token_id if not args.ignore_eos else -1,
             meta_tensors={
                 "step": step,
@@ -326,9 +365,7 @@ if __name__ == "__main__":
                 "num_new_tokens": num_new_tokens,
                 "prompt_lengths": prompt_lengths,
                 "qo_indptr_buffer": qo_indptr_buffer,
-                "paged_kv_indptr_buffer": paged_kv_indptr_buffer,
-                "paged_kv_indices_buffer": paged_kv_indices_buffer,
-                "paged_kv_last_page_len_buffer": paged_kv_last_page_len_buffer,
+                **kv_meta_tensors,
             },
             profiler_tensor=profiler_tensor,
             trace_name=args.trace_name,
@@ -453,6 +490,24 @@ if __name__ == "__main__":
             name="argmax_part_index",
             io_category="cuda_tensor",
         )
+        # Temperature/top-k/top-p sampling keeps its candidates in fp32 and
+        # needs topk_max + 2 slots per worker (candidates, chunk max, chunk
+        # exp-sum); greedy decoding keeps using the argmax buffers above.
+        if args.do_sample:
+            sampling_part_value = mpk.new_tensor(
+                dims=(args.max_num_batched_tokens,
+                      mpk.num_workers * (args.sampling_topk_max + 2)),
+                dtype=mi.float32,
+                name="sampling_part_value",
+                io_category="cuda_tensor",
+            )
+            sampling_part_index = mpk.new_tensor(
+                dims=(args.max_num_batched_tokens,
+                      mpk.num_workers * args.sampling_topk_max),
+                dtype=mi.int64,
+                name="sampling_part_index",
+                io_category="cuda_tensor",
+            )
         argmax_out = mpk.attach_input(torch_tensor=output_tokens, name="output_token")
         #argmax_out = mpk.new_tensor(
         #    dims=(args.max_num_batched_tokens, 1),
@@ -540,11 +595,14 @@ if __name__ == "__main__":
             w_k_norm = mpk.attach_input(
                 torch_tensor=layer.self_attn.k_norm.weight, name=f"layer_{i}_k_norm"
             )
+            # kv_plan.layer_info() resolves (group_id, slot_id) for this layer.
+            # For single spec, slot_id == layer_idx.
+            group_id, slot_id = kv_plan.layer_info(i)
             k_cache = mpk.attach_input(
-                torch_tensor=model.model.kv_cache[0][i], name=f"layer_{i}_k_cache"
+                torch_tensor=model.model.kv_cache[0][slot_id], name=f"layer_{i}_k_cache"
             ) 
             v_cache = mpk.attach_input(
-                torch_tensor=model.model.kv_cache[1][i], name=f"layer_{i}_v_cache"
+                torch_tensor=model.model.kv_cache[1][slot_id], name=f"layer_{i}_v_cache"
             )
             # TODO: Later attention kernels should be merged as one
             if spec_decode_config:
@@ -574,6 +632,7 @@ if __name__ == "__main__":
                     attention_params=(num_local_q_heads, num_kv_cache_chunks),
                     grid_dim=(mpk.max_num_batched_requests, num_local_kv_heads, num_kv_cache_chunks),
                     block_dim=(128, 1, 1),
+                    group_id=group_id,
                 )
 
                 mpk.paged_attention_split_kv_merge_layer(
@@ -583,6 +642,7 @@ if __name__ == "__main__":
                     attention_params=(num_local_q_heads, head_dim),
                     grid_dim=(mpk.max_num_batched_requests, num_local_kv_heads, 1),
                     block_dim=(128, 1, 1),
+                    group_id=group_id,
                 )
             else:
                 mpk.paged_attention_layer(
@@ -596,6 +656,7 @@ if __name__ == "__main__":
                     output=attn_out,
                     grid_dim=(mpk.max_num_batched_requests, num_local_kv_heads, 1),
                     block_dim=(128, 1, 1),
+                    group_id=group_id,
                 )
             
             
@@ -741,26 +802,48 @@ if __name__ == "__main__":
         #    block_dim=(128, 1, 1),
         #)
         # add argmax layer
-        if spec_decode_config and spec_decode_config.method == "promptlookup":
-            argmax_partial_grid_dim = (max_factor_leq_n(153600, 96 // (spec_decode_config.spec_length + 1)), 
-                                       spec_decode_config.spec_length + 1, 
-                                       1)
-            argmax_reduce_grid_dim = (1, spec_decode_config.spec_length + 1, 1)
+        if args.do_sample:
+            mpk.sampling_partial_layer(
+                input=argmax_in,
+                output=(sampling_part_value, sampling_part_index),
+                grid_dim=(mpk.num_workers, 1, 1),
+                block_dim=(128, 1, 1),
+                vocab_size=model.config.vocab_size,
+                topk_max=args.sampling_topk_max,
+                temperature=args.temperature,
+            )
+            mpk.sampling_reduce_layer(
+                input=(sampling_part_value, sampling_part_index),
+                output=argmax_out,
+                grid_dim=(1, 1, 1),
+                block_dim=(128, 1, 1),
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                seed=args.seed,
+            )
         else:
-            argmax_partial_grid_dim = (mpk.num_workers, 1, 1)
-            argmax_reduce_grid_dim = (1, 1, 1)
-        mpk.argmax_partial_layer(
-            input=argmax_in,
-            output=(argmax_part_value, argmax_part_index),
-            grid_dim=argmax_partial_grid_dim,
-            block_dim=(128, 1, 1),
-        )
-        mpk.argmax_reduce_layer(
-            input=(argmax_part_value, argmax_part_index),
-            output=argmax_out,
-            grid_dim=argmax_reduce_grid_dim,
-            block_dim=(128, 1, 1),
-        )
+            if spec_decode_config and spec_decode_config.method == "promptlookup":
+                argmax_partial_grid_dim = (max_factor_leq_n(153600, 96 // (spec_decode_config.spec_length + 1)), 
+                                           spec_decode_config.spec_length + 1, 
+                                           1)
+                argmax_reduce_grid_dim = (1, spec_decode_config.spec_length + 1, 1)
+            else:
+                argmax_partial_grid_dim = (mpk.num_workers, 1, 1)
+                argmax_reduce_grid_dim = (1, 1, 1)
+            mpk.argmax_partial_layer(
+                input=argmax_in,
+                output=(argmax_part_value, argmax_part_index),
+                grid_dim=argmax_partial_grid_dim,
+                block_dim=(128, 1, 1),
+                vocab_size=model.config.vocab_size,
+            )
+            mpk.argmax_reduce_layer(
+                input=(argmax_part_value, argmax_part_index),
+                output=argmax_out,
+                grid_dim=argmax_reduce_grid_dim,
+                block_dim=(128, 1, 1),
+            )
         if spec_decode_config:
             verify_out = mpk.verify_layer_dispatcher(
                 spec_decode_config = spec_decode_config,
@@ -799,6 +882,26 @@ if __name__ == "__main__":
                 stream=stream,
             )
             next_token = logits.argmax(dim=-1)
+            if args.do_sample:
+                # Match the megakernel path: temperature → top-k → top-p → draw.
+                row = logits[0, -1, : model.config.vocab_size].float()
+                row = row / args.temperature
+                if args.top_k > 0:
+                    kth = torch.topk(row, min(args.top_k, row.numel())).values[-1]
+                    row = row.masked_fill(row < kth, float("-inf"))
+                if args.top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(row, descending=True)
+                    probs = torch.softmax(sorted_logits, dim=-1)
+                    cum = torch.cumsum(probs, dim=-1)
+                    keep = cum <= args.top_p
+                    keep[..., 0] = True
+                    row = row.clone()
+                    row[sorted_idx[~keep]] = float("-inf")
+                probs = torch.softmax(row, dim=-1)
+                g = torch.Generator(device=probs.device)
+                g.manual_seed(args.seed + cur_pos)
+                next_token = torch.multinomial(probs, 1, generator=g)
+                next_token = next_token.view(1, 1)
             next_token = next_token[0, -1]
             tokens[0, cur_pos] = next_token
             prev_pos = cur_pos
